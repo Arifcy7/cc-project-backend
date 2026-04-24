@@ -2,7 +2,6 @@ const express = require("express");
 const mongoose = require("mongoose");
 const dotenv = require("dotenv");
 const cors = require("cors");
-const path = require("path");
 const bcrypt = require("bcryptjs");
 
 const authRoutes = require("./routes/auth");
@@ -14,7 +13,6 @@ const User = require("./models/User");
 dotenv.config();
 
 const app = express();
-const frontendPath = path.join(__dirname, "..", "frontend");
 const corsOrigins = (process.env.CORS_ORIGIN || "")
  .split(",")
  .map(origin => origin.trim())
@@ -30,8 +28,6 @@ app.use(
  })
 );
 
-app.use(express.static(frontendPath));
-
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/posts", postRoutes);
@@ -39,18 +35,6 @@ app.use("/api/comments", commentRoutes);
 
 app.get("/api/health", (req, res) => {
  res.json({ status: "ok", service: "cloud-forum-api" });
-});
-
-app.use((req, res, next) => {
- if (req.originalUrl.startsWith("/api/")) {
-  return next();
- }
-
- if (req.method !== "GET" && req.method !== "HEAD") {
-  return next();
- }
-
- res.sendFile(path.join(frontendPath, "index.html"));
 });
 
 const startServer = async () => {
