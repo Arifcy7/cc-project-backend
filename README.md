@@ -1,21 +1,23 @@
 # Aurwell Clinic Booking System — Technical & Functional Specification
 
-## 1. Executive Summary & Objectives
+## 1. Executive Summary & System Roles
 
-The **Aurwell Clinic Booking System** is a multi-tenant booking engine built on top of the existing Aurwell Firebase backend. It allows each clinic to operate an isolated scheduling, staff, and appointment system, while offering patients a seamless, white-labeled booking portal accessible via unique subdomains (`clinicname.aurwell.app`).
+The **Aurwell Clinic Booking System** is a dedicated, high-concurrency booking engine built to power public subdomain portals (`clinicname.aurwell.app`) and patient mobile applications.
 
-### Key Capabilities:
-- **Tenant Isolation & Flexibility**: Support for clinics with Aurwell's native booking engine, external booking SDKs/links (e.g., Fresha, Phorest), or disabled booking.
-- **Operating Hours & Date Overrides**: Flexible weekly operating hours with holiday/closure date overrides.
-- **Doctor / Staff Availability**: Independent doctor shifts, break periods, and leave calendars.
-- **Treatment Durations & Buffers**: Individual service durations and post-treatment room recovery/prep buffers.
-- **Concurrency & Double-Booking Prevention**: Distributed slot locking with a temporary 10-minute hold window during checkout.
-- **Reused Stripe Infrastructure**: Direct integration with each clinic's existing Stripe credentials for upfront deposits or full payments.
-- **Automated Notifications**: Instant confirmation emails with 1-click Google Calendar / ICS calendar integration.
+### Architectural Boundary & Separation of Concerns:
+1. **Existing Admin Panel**:
+   - Directly interacts with **Cloud Firestore** using the Firebase Client/Admin SDK.
+   - Manages clinic hours, doctor profiles, weekly shifts, date overrides, and manual appointment booking/cancellations directly without requiring an intermediate backend.
+2. **Existing Stripe Backend** (`https://api-guexeyftta-uc.a.run.app`):
+   - Already deployed and fully functional on Cloud Run.
+   - Reused as-is for creating PaymentIntents (`POST /payments/create-intent`), verifying payments (`POST /payments/confirm`), issuing refunds (`POST /payments/refund`), and processing Stripe webhooks.
+3. **Dedicated Booking Backend (This Scope)**:
+   - Dedicated patient-facing service deployed as **Firebase Cloud Functions (2nd Gen)**.
+   - Handles public slot availability calculations, atomic slot reservation holds (10-min locks to prevent race conditions), Stripe payment handoff to the existing Stripe backend, appointment lifecycle confirmation, and automated confirmation emails with Google Calendar links.
 
 ---
 
-## 2. Technology Stack & Deployment Architecture
+## 2. Updated Technology Stack & Deployment Architecture
 
 ```
                                   ┌─────────────────────────────┐
@@ -25,61 +27,179 @@ The **Aurwell Clinic Booking System** is a multi-tenant booking engine built on 
                                                  │
                                                  ▼
                                   ┌─────────────────────────────┐
-                                  │     Next.js Application     │
-                                  │   (Subdomain Middleware)    │
+                                  │   Public Booking Frontend   │
+                                  │   (Next.js App / Mobile)    │
+                                  │   clinicname.aurwell.app    │
                                   └──────┬───────────────┬──────┘
                                          │               │
-                     ┌───────────────────┘               └───────────────────┐
-                     ▼                                                       ▼
-        ┌─────────────────────────┐                             ┌─────────────────────────┐
-        │  Public Booking Portal  │                             │   Admin Panel Portal    │
-        │ clinicname.aurwell.app  │                             │    admin.aurwell.app    │
-        └────────────┬────────────┘                             └────────────┬────────────┘
-                     │                                                       │
-                     └───────────────────┬───────────────────────────────────┘
-                                         ▼
-                          ┌─────────────────────────────┐
-                          │   Firebase Cloud Functions  │
-                          │   (Node.js 20 / TypeScript) │
-                          └──────────────┬──────────────┘
-                                         │
-                 ┌───────────────────────┼───────────────────────┐
-                 ▼                       ▼                       ▼
-      ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
-      │   Cloud Firestore   │ │  Clinic Stripe API  │ │  Email Dispatcher   │
-      │  (Atomic Locks & DB)│ │ (Payments/Webhooks) │ │ (Resend / SendGrid) │
-      └─────────────────────┘ └─────────────────────┘ └─────────────────────┘
+                    Slot Query & Holds   │               │ Direct Public Reads
+                                         ▼               ▼
+                        ┌─────────────────────────┐  ┌─────────────────────────┐
+                        │ Aurwell Booking Backend │  │     Cloud Firestore     │
+                        │ (Cloud Functions API)   │  │    (Direct DB Access)   │
+                        └──────┬───────────┬──────┘  └───────────▲─────────────┘
+                               │           │                     │
+      Create / Verify Payment  │           │ Write Confirmed     │ Direct Admin CRUD
+                               ▼           │ Appointments & Holds│ (Hours, Doctors,
+          ┌───────────────────────────┐    │                     │  Manual Bookings)
+          │  Existing Stripe Backend  │    │                     │
+          │ api-guexeyftta-uc.a.run   │    │                     │
+          └───────────────────────────┘    │                     │
+                                           ▼                     │
+                              ┌─────────────────────────┐        │
+                              │ Send Email Notification │        │
+                              │ (Google Calendar Link)  │        │
+                              └─────────────────────────┘        │
+                                                                 │
+                                                    ┌────────────┴────────────┐
+                                                    │   Aurwell Admin Panel   │
+                                                    │  (Existing Next.js App) │
+                                                    └─────────────────────────┘
 ```
-
-### Stack Components:
-1. **Frontend (Public Portal & Admin Panel)**: Next.js (App Router) with TypeScript and Tailwind CSS. Next.js middleware extracts the hostname/subdomain to dynamically load the clinic tenant context.
-2. **Backend & Booking Engine**: Firebase Cloud Functions (2nd Gen) providing secure REST/Callable endpoints for slot calculations, reservation holds, Stripe payment intents, and cancellation logic.
-3. **Database**: Cloud Firestore (NoSQL) utilizing atomic transactions (`runTransaction`) for race-condition prevention.
-4. **Payments**: Stripe Connect / Direct Tenant Stripe credentials already configured in `/clinics/{clinicId}`.
-5. **Transactional Emails**: SendGrid, Resend, or Firebase Trigger Email extension with dynamic Google Calendar deep links and `.ics` file generation.
 
 ---
 
-## 3. Database Schema Specifications (`FIREBASE_SCHEMA.md` Extensions)
+## 3. Booking Backend Responsibilities & API Endpoints
 
-### 3.1. Clinic Tenant Root Extension (`/clinics/{clinicId}`)
+The dedicated Booking Backend exposes lightweight, fast endpoints tailored for patient booking:
 
-Add the `bookingConfig` object to the clinic document:
+### 3.1. `POST /api/booking/available-slots`
+Calculates available bookable start times for a specific treatment, doctor (or any doctor), and date.
+- **Input**: `{ clinicId, treatmentId, doctorId (optional), date: "YYYY-MM-DD" }`
+- **Logic**:
+  1. Fetches clinic operating hours and checks date overrides.
+  2. Fetches active doctors qualified for `treatmentId` and their specific working shifts.
+  3. Fetches blocked slots/leaves and existing appointments (`status == "confirmed"` OR active `"held"` slots where `holdExpiresAt > now`).
+  4. Computes free time windows matching `treatment.durationMinutes + treatment.bufferMinutes`.
+- **Output**:
+```json
+{
+  "date": "2026-09-18",
+  "clinicId": "clinic_123",
+  "treatment": {
+    "id": "treat_01",
+    "title": "HydraFacial Deluxe",
+    "durationMinutes": 45,
+    "price": 180
+  },
+  "slots": [
+    { "time": "09:00", "doctorIds": ["doc_01", "doc_02"] },
+    { "time": "09:45", "doctorIds": ["doc_01"] },
+    { "time": "10:30", "doctorIds": ["doc_02"] }
+  ]
+}
+```
+
+---
+
+### 3.2. `POST /api/booking/reserve-hold`
+Atomically holds a slot for 10 minutes during the patient's checkout flow to prevent double booking.
+- **Input**:
+```json
+{
+  "clinicId": "clinic_123",
+  "treatmentId": "treat_01",
+  "variantTitle": "Full Face",
+  "doctorId": "doc_01",
+  "startDateTime": "2026-09-18T10:00:00Z",
+  "patient": {
+    "name": "Sarah Miller",
+    "email": "sarah.miller@example.com",
+    "phone": "+44 7700 900123",
+    "notes": "Sensitive skin"
+  }
+}
+```
+- **Execution**:
+  1. Opens a **Firestore Transaction**.
+  2. Validates that no overlapping `confirmed` appointment or active `held` appointment exists for `doc_01` during the window $[T_{start}, T_{end} + \text{buffer}]$.
+  3. If occupied: returns `409 Conflict` ("Slot just taken, please select another time").
+  4. If free: creates a new document in `/clinics/{clinicId}/appointments/{appointmentId}` with:
+     - `status`: `"held"`
+     - `holdExpiresAt`: `Timestamp.now() + 10 minutes`
+  5. If clinic requires payment: Calls the **Existing Stripe Backend** (`POST https://api-guexeyftta-uc.a.run.app/payments/create-intent`) using the clinic's Stripe credentials.
+- **Output**:
+```json
+{
+  "appointmentId": "apt_20260918_8841",
+  "holdExpiresAt": "2026-09-10T22:01:36Z",
+  "paymentRequired": true,
+  "payment": {
+    "clientSecret": "pi_3Ty7..._secret_xyz123",
+    "paymentIntentId": "pi_3Ty7...",
+    "amount": 90.0,
+    "currency": "GBP"
+  }
+}
+```
+
+---
+
+### 3.3. `POST /api/booking/confirm`
+Finalizes the appointment after the client completes the payment or if no payment is required.
+- **Input**:
+```json
+{
+  "clinicId": "clinic_123",
+  "appointmentId": "apt_20260918_8841",
+  "paymentIntentId": "pi_3Ty7..." // optional if free
+}
+```
+- **Execution**:
+  1. If payment was required, verifies status with the **Existing Stripe Backend** (`GET /payments/status/{clinicId}/{paymentIntentId}`).
+  2. Updates the Firestore document:
+     - `status`: `"confirmed"`
+     - `holdExpiresAt`: `null`
+     - `payment.status`: `"paid"`
+  3. Dispatches the confirmation email with the **Google Calendar 1-Click Link** and `.ics` attachment.
+- **Output**:
+```json
+{
+  "success": true,
+  "appointmentId": "apt_20260918_8841",
+  "status": "confirmed",
+  "calendarLink": "https://calendar.google.com/calendar/render?action=TEMPLATE&..."
+}
+```
+
+---
+
+### 3.4. `POST /api/booking/cancel` (Patient Self-Service)
+Allows patients to cancel appointments within the clinic's allowable cancellation window (`cancellationHours`).
+- **Input**: `{ clinicId, appointmentId, email, cancelReason }`
+- **Execution**:
+  1. Validates cancellation policy (`appointment.startDateTime - now > clinic.cancellationHours`).
+  2. Updates `status: "cancelled"`.
+  3. If refundable: Calls Existing Stripe Backend (`POST /payments/refund`).
+  4. Sends cancellation notification email.
+
+---
+
+### 3.5. Scheduled Maintenance: `cleanupExpiredHolds`
+A lightweight Pub/Sub scheduled function running every 5 minutes:
+- Queries `/clinics/{clinicId}/appointments` where `status == "held"` and `holdExpiresAt < now()`.
+- Updates `status: "expired"`, releasing the slot for other patients.
+
+---
+
+## 4. Clinic Multi-Tenancy & External Booking Flags
+
+On the `/clinics/{clinicId}` document in Firestore, the admin panel directly configures the `bookingConfig` object:
 
 ```json
 {
   "bookingConfig": {
-    "systemType": "aurwell_custom",
-    "subdomain": "harleystreet",
-    "customDomain": null,
+    "systemType": "aurwell_custom", // "aurwell_custom" | "external_sdk" | "disabled"
+    "subdomain": "harleystreet",     // powers harleystreet.aurwell.app
+    "customDomain": null,            // optional e.g. booking.harleystreet.com
     "externalBooking": {
-      "provider": "fresha",
+      "provider": "fresha",          // "fresha" | "phorest" | "custom_link"
       "url": "https://fresha.com/a/example-clinic"
     },
     "settings": {
       "requirePaymentUpfront": true,
-      "depositType": "percentage",
-      "depositAmount": 50,
+      "depositType": "percentage",   // "full" | "percentage" | "fixed"
+      "depositAmount": 50,           // 50% deposit
       "slotIntervalMinutes": 15,
       "minNoticeHours": 2,
       "maxAdvanceDays": 60,
@@ -90,83 +210,51 @@ Add the `bookingConfig` object to the clinic document:
 }
 ```
 
-| Field Path | Type | Description |
-|---|---|---|
-| `bookingConfig.systemType` | `string` | Mode: `"aurwell_custom"`, `"external_sdk"`, or `"disabled"` |
-| `bookingConfig.subdomain` | `string` | Unique subdomain prefix (e.g. `"harleystreet"`) |
-| `bookingConfig.customDomain` | `string \| null` | Optional custom domain (e.g. `"booking.harleystreet.com"`) |
-| `bookingConfig.externalBooking.provider`| `string` | External provider name (e.g. `"fresha"`, `"phorest"`, `"custom_link"`) |
-| `bookingConfig.externalBooking.url` | `string` | External booking URL to redirect patients to |
-| `bookingConfig.settings.requirePaymentUpfront` | `boolean` | Whether payment/deposit is required at checkout |
-| `bookingConfig.settings.depositType` | `string` | `"full"`, `"percentage"`, or `"fixed"` |
-| `bookingConfig.settings.depositAmount` | `number` | Amount in currency or percentage |
-| `bookingConfig.settings.slotIntervalMinutes` | `number` | Step interval for available slot generation (default: `15`) |
-| `bookingConfig.settings.minNoticeHours` | `number` | Minimum hours before booking time (default: `2`) |
-| `bookingConfig.settings.maxAdvanceDays` | `number` | Maximum days into the future patients can book (default: `60`) |
-| `bookingConfig.settings.cancellationHours` | `number` | Free cancellation window in hours (default: `24`) |
-| `bookingConfig.settings.holdDurationMinutes` | `number` | Temporary reservation lock duration (default: `10`) |
+### Behavior by `systemType`:
+- **`aurwell_custom`**: Subdomain renders the native Aurwell multi-step booking wizard (Treatment $\rightarrow$ Doctor $\rightarrow$ Slot $\rightarrow$ Details $\rightarrow$ Stripe Pay).
+- **`external_sdk`**: Subdomain automatically loads or redirects to the clinic's third-party widget (e.g., Fresha / Phorest).
+- **`disabled`**: Subdomain displays a branded contact/inquiry page stating online booking is currently unavailable.
 
 ---
 
-### 3.2. Subdomain Lookup Root Collection (`/subdomains/{subdomain}`)
-Fast O(1) tenant lookup for public requests.
+## 5. Firestore Database Structure (`FIREBASE_SCHEMA.md` Extensions)
 
-- **Path**: `/subdomains/{subdomain}`
-- **Document ID**: `subdomain` (e.g. `harleystreet`)
+All subcollections are directly under `/clinics/{clinicId}`:
 
-```json
-{
-  "clinicId": "clinic_ownerUid123",
-  "subdomain": "harleystreet",
-  "isActive": true,
-  "createdAt": "2026-09-10T21:44:00Z"
-}
+```
+/clinics (root collection)
+    └── {clinicId} (clinic config document)
+         ├── /treatments/{treatmentId}        (Add durationMinutes, bufferMinutes)
+         ├── /doctors/{doctorId}              (Doctor profiles & qualifications)
+         ├── /schedules/operating_hours       (Clinic weekly hours & date overrides)
+         ├── /schedules/doctor_{doctorId}     (Doctor weekly shifts)
+         ├── /blocked_slots/{slotId}          (Leaves, holidays, breaks)
+         └── /appointments/{appointmentId}    (Appointments & active holds)
+
+/subdomains (root lookup collection)
+    └── {subdomain}                          (Maps "harleystreet" -> "clinic_dxwk70NNVXdI05ftD9CuHmuZ5212")
 ```
 
----
-
-### 3.3. Treatment Enhancements (`/clinics/{clinicId}/treatments/{treatmentId}`)
-
-Add duration and scheduling parameters to existing treatment records:
+### 5.1. Doctor Document Schema (`/clinics/{clinicId}/doctors/{doctorId}`)
+Managed directly by Admin Panel:
 
 | Field | Type | Description |
 |---|---|---|
-| `durationMinutes` | `number` | Treatment duration in minutes (e.g. `45`) |
-| `bufferMinutes` | `number` | Post-treatment cleaning/prep time in minutes (e.g. `15`) |
-| `depositRequired` | `boolean \| null` | Optional treatment-level deposit override |
+| `doctorId` | `string` | Unique doctor identifier |
+| `name` | `string` | Doctor full name (e.g. `"Dr. Sarah Jenkins"`) |
+| `title` | `string` | Designation / Specialty (e.g. `"Aesthetic Doctor"`) |
+| `email` | `string` | Doctor contact & notification email |
+| `phone` | `string` | Contact phone |
+| `avatarUrl` | `string` | Profile image URL |
+| `bio` | `string` | Short practitioner biography |
+| `assignedTreatments` | `array` of `string` | Treatment IDs this doctor performs (or `["all"]`) |
+| `isActive` | `boolean` | Toggle active status |
+| `createdAt` | `timestamp` | Creation timestamp |
 
 ---
 
-### 3.4. Doctors Subcollection (`/clinics/{clinicId}/doctors/{doctorId}`)
-
-Stores doctor profiles, qualifications, and active statuses.
-
-- **Path**: `/clinics/{clinicId}/doctors/{doctorId}`
-- **Document ID**: Auto-generated (`doc_...`)
-
-```json
-{
-  "doctorId": "doc_8231",
-  "name": "Dr. Sarah Jenkins",
-  "title": "Senior Aesthetic Practitioner",
-  "email": "dr.jenkins@harleystreet.com",
-  "phone": "+44 20 7946 0999",
-  "avatarUrl": "https://firebasestorage.googleapis.com/.../avatar.jpg",
-  "bio": "Specialist in non-surgical facial rejuvenation with 12+ years experience.",
-  "assignedTreatments": ["treatment_01", "treatment_02"],
-  "allTreatments": false,
-  "isActive": true,
-  "createdAt": "2026-09-10T21:44:00Z",
-  "updatedAt": "2026-09-10T21:44:00Z"
-}
-```
-
----
-
-### 3.5. Schedules & Hours (`/clinics/{clinicId}/schedules/{scheduleId}`)
-
-#### Clinic Operating Hours Doc ID: `operating_hours`
-- **Path**: `/clinics/{clinicId}/schedules/operating_hours`
+### 5.2. Clinic Operating Hours & Overrides (`/clinics/{clinicId}/schedules/operating_hours`)
+Managed directly by Admin Panel:
 
 ```json
 {
@@ -195,8 +283,10 @@ Stores doctor profiles, qualifications, and active statuses.
 }
 ```
 
-#### Doctor Working Shifts Doc ID: `doctor_{doctorId}`
-- **Path**: `/clinics/{clinicId}/schedules/doctor_{doctorId}`
+---
+
+### 5.3. Doctor Working Shifts (`/clinics/{clinicId}/schedules/doctor_{doctorId}`)
+Managed directly by Admin Panel:
 
 ```json
 {
@@ -215,35 +305,13 @@ Stores doctor profiles, qualifications, and active statuses.
 
 ---
 
-### 3.6. Blocked Slots & Leaves (`/clinics/{clinicId}/blocked_slots/{slotId}`)
-
-- **Path**: `/clinics/{clinicId}/blocked_slots/{slotId}`
-- **Document ID**: Auto-generated (`block_...`)
+### 5.4. Appointment Document Schema (`/clinics/{clinicId}/appointments/{appointmentId}`)
+Written by Booking Backend & Admin Panel:
 
 ```json
 {
-  "id": "block_4921",
-  "doctorId": "doc_8231",
-  "scope": "doctor",
-  "startDateTime": "2026-10-10T09:00:00Z",
-  "endDateTime": "2026-10-15T18:00:00Z",
-  "type": "leave",
-  "reason": "Annual Leave / Conference",
-  "createdAt": "2026-09-10T21:44:00Z"
-}
-```
-
----
-
-### 3.7. Appointments Subcollection (`/clinics/{clinicId}/appointments/{appointmentId}`)
-
-- **Path**: `/clinics/{clinicId}/appointments/{appointmentId}`
-- **Document ID**: Auto-generated or prefixed (`apt_...`)
-
-```json
-{
-  "appointmentId": "apt_20260910_8841",
-  "clinicId": "clinic_ownerUid123",
+  "appointmentId": "apt_20260918_8841",
+  "clinicId": "clinic_dxwk70NNVXdI05ftD9CuHmuZ5212",
   "doctorId": "doc_8231",
   "doctorName": "Dr. Sarah Jenkins",
   "patient": {
@@ -276,15 +344,7 @@ Stores doctor profiles, qualifications, and active statuses.
     "amountPaid": 90,
     "depositType": "percentage",
     "currency": "GBP",
-    "stripePaymentIntentId": "pi_3MtwBwLkdIwHu7ix28a3tqPa",
-    "stripeCustomerId": "cus_991823",
-    "transactionId": "tx_1721669800000_abc"
-  },
-  "cancellation": {
-    "isCancelled": false,
-    "cancelledAt": null,
-    "cancelledBy": null,
-    "reason": null
+    "stripePaymentIntentId": "pi_3MtwBwLkdIwHu7ix28a3tqPa"
   },
   "createdAt": "2026-09-10T21:44:00Z",
   "updatedAt": "2026-09-10T21:44:00Z"
@@ -293,139 +353,42 @@ Stores doctor profiles, qualifications, and active statuses.
 
 ---
 
-## 4. Availability Engine & Concurrency Algorithm
-
-### 4.1. Slot Computation Formula
-
-A time slot $[T_{start}, T_{end}]$ is available if and only if **all** of the following conditions are met:
-
-$$\text{Slot Available} = (T \subseteq \text{Clinic Hours}) \land (T \subseteq \text{Doctor Shifts}) \land (T \cap \text{Date Overrides} = \emptyset) \land (T \cap \text{Doctor Leaves} = \emptyset) \land (T \cap \text{Existing Bookings} = \emptyset)$$
-
-Where $\text{Existing Bookings}$ includes:
-1. All appointments with `status == "confirmed"`.
-2. All appointments with `status == "held"` where `holdExpiresAt > now()`.
-
-```
-                    ┌──────────────────────────────┐
-                    │      Clinic Open Hours       │
-                    └──────────────┬───────────────┘
-                                   │ INTERSECT
-                                   ▼
-                    ┌──────────────────────────────┐
-                    │     Doctor Working Shift     │
-                    └──────────────┬───────────────┘
-                                   │ SUBTRACT
-                                   ▼
-                    ┌──────────────────────────────┐
-                    │   Clinic Holidays/Overrides  │
-                    └──────────────┬───────────────┘
-                                   │ SUBTRACT
-                                   ▼
-                    ┌──────────────────────────────┐
-                    │   Doctor Leaves & Breaks     │
-                    └──────────────┬───────────────┘
-                                   │ SUBTRACT
-                                   ▼
-                    ┌──────────────────────────────┐
-                    │ Confirmed & Active Holds     │
-                    └──────────────┬───────────────┘
-                                   │
-                                   ▼
-                    [ List of Bookable Start Times ]
-```
-
----
-
-### 4.2. Double-Booking Prevention (Atomic Reservation Protocol)
-
-To eliminate race conditions when two patients select the same slot simultaneously:
+## 6. Payment Flow with Existing Stripe Backend
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Patient
-    participant Browser as clinicname.aurwell.app
-    participant CloudFn as Cloud Function (reserveSlot)
+    participant Web as clinicname.aurwell.app
+    participant BookingAPI as Aurwell Booking Backend
+    participant StripeBackend as Existing Stripe Backend (api-guexeyftta...)
     participant DB as Cloud Firestore
-    participant Stripe as Clinic Stripe
 
-    Patient->>Browser: Selects 10:00 AM Slot & Enters Details
-    Browser->>CloudFn: POST /api/booking/reserve-slot
-    Note over CloudFn,DB: Begins Firestore Transaction
-    CloudFn->>DB: Query Confirmed + Active Holds overlapping [10:00, 11:00]
-    alt Slot is already occupied/held
-        CloudFn-->>Browser: 409 Conflict ("Slot no longer available")
-        Browser-->>Patient: Prompts to select alternative time or doctor
-    else Slot is free
-        CloudFn->>DB: Create Appointment with status="held", holdExpiresAt=now+10m
-        CloudFn->>Stripe: Create PaymentIntent (amount=deposit)
-        CloudFn-->>Browser: Returns clientSecret & appointmentId
-        Browser->>Patient: Displays Stripe Payment Sheet (10-min countdown)
-        Patient->>Stripe: Completes Payment
-        Stripe->>CloudFn: Webhook: payment_intent.succeeded
-        CloudFn->>DB: Update Appointment status="confirmed", holdExpiresAt=null
-        CloudFn->>Patient: Sends Confirmation Email + Google Calendar Link
-    end
+    Patient->>Web: Selects Doctor, Time & Enters Info
+    Web->>BookingAPI: POST /api/booking/reserve-hold
+    Note over BookingAPI,DB: Firestore Transaction (Atomic Check & Hold)
+    BookingAPI->>DB: Check overlap. If free, create doc with status="held", holdExpiresAt=now+10m
+    BookingAPI->>StripeBackend: POST /payments/create-intent { clinicId, amount, currency }
+    StripeBackend-->>BookingAPI: Returns { clientSecret, paymentIntentId }
+    BookingAPI-->>Web: Returns { appointmentId, clientSecret }
+    
+    Patient->>Web: Pays via Stripe Elements / Apple Pay
+    Web->>StripeBackend: (Card payment processed through Stripe)
+    Web->>BookingAPI: POST /api/booking/confirm { appointmentId, paymentIntentId }
+    BookingAPI->>StripeBackend: GET /payments/status/{clinicId}/{paymentIntentId}
+    StripeBackend-->>BookingAPI: Returns status="succeeded"
+    BookingAPI->>DB: Update appointment: status="confirmed", holdExpiresAt=null
+    BookingAPI->>Patient: Send confirmation email with 1-click Google Calendar link
 ```
 
 ---
 
-## 5. Appointment State Machine
+## 7. Automated Email & 1-Click Google Calendar Link
 
+Upon confirmation, an email is dispatched containing:
+- Clinic name, address, doctor, treatment, variant, and date/time.
+- **Direct 1-Click Google Calendar URL**:
 ```
-               ┌───────────────┐
-               │    Held       │ (10-minute temporary checkout lock)
-               └───────┬───────┘
-                       │
-         ┌─────────────┴─────────────┐
-         │ (Payment Success / Staff) │ (Payment Failed / Abandoned / Timeout)
-         ▼                           ▼
-  ┌───────────────┐           ┌───────────────┐
-  │   Confirmed   │           │    Expired    │
-  └───────┬───────┘           └───────────────┘
-          │
-  ┌───────┼───────────────────────────┐
-  │       │                           │
-  ▼       ▼                           ▼
-┌───────────┐ ┌───────────┐     ┌───────────┐
-│ Completed │ │ Cancelled │     │  No-Show  │
-└───────────┘ └───────────┘     └───────────┘
+https://calendar.google.com/calendar/render?action=TEMPLATE&text=HydraFacial+Deluxe+with+Dr.+Sarah+Jenkins&dates=20260918T100000Z/20260918T104500Z&details=Booking+ID:+apt_20260918_8841%0AClinic:+Lumière+Aesthetics%0APhone:+%2B44+20+7946+0813&location=47+Harley+Street,+Marylebone
 ```
-
-| Status | Description |
-|---|---|
-| `held` | Temporarily reserved while patient completes checkout (expires in 10 minutes). |
-| `confirmed` | Payment completed (or booked internally by staff). Slot is booked. |
-| `completed` | Patient arrived and received treatment. |
-| `cancelled` | Cancelled by patient or clinic staff (triggers refund if applicable). |
-| `no_show` | Patient failed to attend appointment. |
-| `expired` | Patient abandoned checkout session or payment failed. Slot freed automatically. |
-
----
-
-## 6. Email Notifications & Google Calendar Deep Link
-
-### 6.1. Google Calendar 1-Click Link Format
-```
-https://calendar.google.com/calendar/render?action=TEMPLATE&text={TreatmentName}+at+{ClinicName}&dates={StartUtcISO}/{EndUtcISO}&details={Details}&location={ClinicAddress}
-```
-
-**Example Parameters:**
-- `text`: `HydraFacial Deluxe with Dr. Sarah Jenkins`
-- `dates`: `20260918T100000Z/20260918T104500Z`
-- `details`: `Booking ID: apt_20260910_8841\nClinic: Harley Street Clinic\nDoctor: Dr. Sarah Jenkins\nAddress: 10 Harley St, London W1G 9PF`
-- `location`: `10 Harley St, London W1G 9PF`
-
-### 6.2. `.ics` iCalendar Attachment
-Along with the Google Calendar link, an `.ics` attachment is included in the confirmation email for 1-click import into Apple Calendar and Microsoft Outlook.
-
----
-
-## 7. Implementation Plan
-
-| Phase | Deliverables |
-|---|---|
-| **Phase 1: Schema & Rules** | • Update `FIREBASE_SCHEMA.md` with `/doctors`, `/schedules`, `/blocked_slots`, `/appointments`, and `bookingConfig`.<br>• Update `firestore.rules` for secure tenant access. |
-| **Phase 2: Booking Cloud Functions** | • `getAvailableSlots`: Calculates dynamic bookable slots based on doctor + clinic schedules.<br>• `reserveSlot`: Atomic Firestore transaction holding slot for 10 minutes.<br>• `confirmBookingWebhook`: Handles Stripe webhooks to confirm appointments.<br>• `cleanupExpiredHolds`: Scheduled Cloud Function to release abandoned holds. |
-| **Phase 3: Admin Panel Module** | • Doctor Profile Management.<br>• Weekly Working Hours & Holiday Overrides UI.<br>• Interactive Appointments Calendar (Day / Week / Month views).<br>• Manual Booking / Reschedule / Cancel modal. |
-| **Phase 4: Public Booking App (`*.aurwell.app`)** | • Multi-tenant Subdomain Routing Middleware.<br>• 4-Step Booking Wizard (Treatment $\rightarrow$ Doctor $\rightarrow$ Date/Time $\rightarrow$ Details & Stripe Checkout).<br>• Booking Confirmation Page + Email Dispatch + Google Calendar link. |
+- Standard `.ics` iCalendar attachment for iOS / Apple Calendar and Outlook.
