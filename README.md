@@ -1,27 +1,28 @@
 # 📘 Aurwell Clinic Booking System — Complete Backend & Integration Documentation
 
-Welcome to the comprehensive technical documentation for the **Aurwell Multi-Tenant Clinic Booking Engine**. This document serves as the single reference for API endpoints, request/response contracts, multi-tenant database models, and integration guides for the **Public Subdomain Web Portal (`*.aurwell.app`)**, **Mobile App**, and **Admin Panel**.
+Welcome to the comprehensive technical documentation for the **Aurwell Multi-Tenant Clinic Booking Engine**. This document serves as the single source of truth for API endpoints, request/response contracts, multi-tenant database models, security/authentication flows, and integration guides for the **Public Subdomain Web Portal (`*.aurwell.app`)**, **Mobile App**, and **Admin Panel**.
 
 ---
 
 ## 📑 Table of Contents
 
 1. [System Architecture & Roles](#1-system-architecture--roles)
-2. [Complete REST API Reference](#2-complete-rest-api-reference)
-   - [`GET /health`](#21-get-health)
-   - [`GET /api/subdomain/:subdomain`](#22-get-apisubdomainsubdomain)
-   - [`GET /api/clinic/:clinicId/public`](#23-get-apiclinicclinicidpublic)
-   - [`POST /api/booking/available-slots`](#24-post-apibookingavailable-slots)
-   - [`POST /api/booking/reserve-hold`](#25-post-apibookingreserve-hold)
-   - [`POST /api/booking/confirm`](#26-post-apibookingconfirm)
-   - [`POST /api/booking/cancel`](#27-post-apibookingcancel)
-   - [`POST /api/dev/seed`](#28-post-apidevseed-development-only)
-3. [Firestore Database Contracts](#3-firestore-database-contracts)
-4. [Public Subdomain Website Integration (`*.aurwell.app`)](#4-public-subdomain-website-integration-aurwellapp)
-5. [Mobile App Integration Guide (Flutter / React Native)](#5-mobile-app-integration-guide)
-6. [Admin Panel Integration Guide](#6-admin-panel-integration-guide)
-7. [Email & Google Calendar Link Generation](#7-email--google-calendar-link-generation)
-8. [Deployment & Environment Variables](#8-deployment--environment-variables)
+2. [Authentication & Security Model](#2-authentication--security-model)
+3. [Complete REST API Reference](#3-complete-rest-api-reference)
+   - [`GET /health`](#31-get-health)
+   - [`GET /api/subdomain/:subdomain`](#32-get-apisubdomainsubdomain)
+   - [`GET /api/clinic/:clinicId/public`](#33-get-apiclinicclinicidpublic)
+   - [`POST /api/booking/available-slots`](#34-post-apibookingavailable-slots)
+   - [`POST /api/booking/reserve-hold`](#35-post-apibookingreserve-hold)
+   - [`POST /api/booking/confirm`](#36-post-apibookingconfirm)
+   - [`POST /api/booking/cancel`](#37-post-apibookingcancel)
+   - [`POST /api/dev/seed`](#38-post-apidevseed-development-only)
+4. [Firestore Database Contracts](#4-firestore-database-contracts)
+5. [Public Subdomain Website Integration (`*.aurwell.app`)](#5-public-subdomain-website-integration-aurwellapp)
+6. [Mobile App Integration Guide (Flutter / React Native)](#6-mobile-app-integration-guide)
+7. [Admin Panel Integration Guide](#7-admin-panel-integration-guide)
+8. [Email & Google Calendar Link Generation](#8-email--google-calendar-link-generation)
+9. [Deployment & Environment Variables](#9-deployment--environment-variables)
 
 ---
 
@@ -41,14 +42,14 @@ Welcome to the comprehensive technical documentation for the **Aurwell Multi-Ten
                                       └──────┬───────────────┬──────┘
                                              │               │
                         Slot Query & Holds   │               │ Direct Public Reads
-                                             ▼               ▼
+                        (Auth: Bearer JWT)   ▼               ▼
                             ┌─────────────────────────┐  ┌─────────────────────────┐
                             │ Aurwell Booking Backend │  │     Cloud Firestore     │
                             │ (Node.js / Express API) │  │    (Direct DB Access)   │
                             └──────┬───────────┬──────┘  └───────────▲─────────────┘
                                    │           │                     │
           Create / Verify Payment  │           │ Write Confirmed     │ Direct Admin CRUD
-                                   ▼           │ Appointments & Holds│ (Hours, Doctors,
+          (Forwards Bearer Token)  ▼           │ Appointments & Holds│ (Hours, Doctors,
               ┌───────────────────────────┐    │                     │  Manual Bookings)
               │  Existing Stripe Backend  │    │                     │
               │ api-guexeyftta-uc.a.run   │    │                     │
@@ -65,15 +66,66 @@ Welcome to the comprehensive technical documentation for the **Aurwell Multi-Ten
                                                         └─────────────────────────┘
 ```
 
-### Separation of Responsibilities:
-- **Booking Backend (This API)**: Dedicated, high-concurrency Node.js microservice handling slot availability calculations, atomic 10-minute reservation holds (race condition protection), Stripe payment handoff, and confirmation emails with Google Calendar links.
-- **Existing Stripe Backend** (`https://api-guexeyftta-uc.a.run.app`): Reused as-is for creating Stripe `PaymentIntents`, checking payment statuses, and handling refunds.
-- **Admin Panel**: Directly communicates with Firestore via the Firebase SDK for clinic settings, doctor CRUD, schedule changes, and manual appointment management.
-- **Patient Clients**: Web (`clinicname.aurwell.app`) and Mobile Apps interact with this Booking API for booking flows.
+---
+
+## 2. Authentication & Security Model
+
+The Booking Engine implements the same **Firebase Authentication Bearer Token** standard used across Aurwell's Stripe Backend:
+
+```http
+Authorization: Bearer <FIREBASE_ID_TOKEN>
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Mobile App / Web Client
+    participant AuthMW as requireAuth Middleware
+    participant FBAdmin as Firebase Admin SDK
+    participant Ctrl as Booking Controller & Service
+    participant StripeAPI as Existing Stripe Backend (FastAPI)
+    participant DB as Cloud Firestore
+
+    Client->>AuthMW: Request with Authorization: Bearer <ID_TOKEN>
+    alt Header Present
+        AuthMW->>FBAdmin: admin.auth().verifyIdToken(token)
+        alt Token Expired or Invalid Signature
+            FBAdmin-->>AuthMW: Error
+            AuthMW-->>Client: 401 Unauthorized (Invalid or expired token)
+        end
+        FBAdmin-->>AuthMW: Decoded Token (uid, email, roles)
+        AuthMW->>AuthMW: Set req.user & req.userUid
+    else Header Missing & Endpoint is Optional
+        AuthMW->>AuthMW: Allow request as Guest Patient
+    end
+    AuthMW->>Ctrl: Forward to Controller
+    Ctrl->>Ctrl: Anti-Spoofing Check (Token UID == patient.patientId)
+    alt UID Mismatch (Spoofing Attempt)
+        Ctrl-->>Client: 403 Forbidden (Token UID does not match patient ID)
+    end
+    Ctrl->>StripeAPI: Forward Authorization Token (POST /payments/create-intent)
+    Ctrl->>DB: Atomic Firestore Transaction
+    DB-->>Client: 200/201 Success Response
+```
+
+### Security Highlights:
+1. **Cryptographic JWT Verification**: Every token is validated against Google's public keys for signature, expiration (`exp`), issuer (`iss`), and audience (`aud`).
+2. **Dual-Mode Support (Optional vs. Required)**:
+   - **Mobile App & Logged-in Users**: Pass `Authorization: Bearer <TOKEN>` to automatically bind bookings to the patient's Aurwell account.
+   - **Public Subdomain Web Visitors (`clinicname.aurwell.app`)**: Can book as guests without requiring prior registration.
+3. **Anti-Spoofing Enforcement (HTTP 403 `FORBIDDEN`)**: If an authenticated token is provided, the backend verifies that `req.userUid` matches `patient.patientId`. A user cannot forge a booking under another user's ID.
+4. **Token Forwarding to Stripe Backend**: When communicating with the existing Stripe backend (`https://api-guexeyftta-uc.a.run.app`), the Booking Engine forwards the client's `Authorization: Bearer <TOKEN>` header.
+
+### Security Status Codes:
+| Status Code | Error Code | Scenario |
+| :--- | :--- | :--- |
+| **`401 Unauthorized`** | `UNAUTHORIZED` | Token is expired, revoked, malformed, or missing on protected endpoints. |
+| **`403 Forbidden`** | `FORBIDDEN` | Authenticated Token UID does not match target patient ID or appointment owner. |
+| **`409 Conflict`** | `SLOT_TAKEN` | Slot was claimed by another patient during checkout (race-condition protection). |
 
 ---
 
-## 2. Complete REST API Reference
+## 3. Complete REST API Reference
 
 **Base URL (Local)**: `http://localhost:8080`  
 **Base URL (Production)**: `https://<YOUR_DEPLOYED_BACKEND_URL>`  
@@ -81,7 +133,7 @@ Welcome to the comprehensive technical documentation for the **Aurwell Multi-Ten
 
 ---
 
-### 2.1. `GET /health`
+### 3.1. `GET /health`
 Health check endpoint for container orchestrators and load balancers.
 
 - **Auth Required**: ❌ No
@@ -97,7 +149,7 @@ Health check endpoint for container orchestrators and load balancers.
 
 ---
 
-### 2.2. `GET /api/subdomain/:subdomain`
+### 3.2. `GET /api/subdomain/:subdomain`
 Resolves a clinic subdomain (e.g. `harleystreet` from `harleystreet.aurwell.app`) into clinic metadata, branding colors, and booking configuration.
 
 - **Auth Required**: ❌ No
@@ -142,7 +194,7 @@ Resolves a clinic subdomain (e.g. `harleystreet` from `harleystreet.aurwell.app`
 
 ---
 
-### 2.3. `GET /api/clinic/:clinicId/public`
+### 3.3. `GET /api/clinic/:clinicId/public`
 Fetches all active treatments and doctors qualified for the clinic's public booking portal.
 
 - **Auth Required**: ❌ No
@@ -197,10 +249,11 @@ Fetches all active treatments and doctors qualified for the clinic's public book
 
 ---
 
-### 2.4. `POST /api/booking/available-slots`
+### 3.4. `POST /api/booking/available-slots`
 Computes all available start times on a target date for a specific treatment by intersecting clinic operating hours, doctor shifts, date overrides, doctor leaves, and existing appointments/active holds.
 
-- **Auth Required**: ❌ No
+- **Auth Required**: ❌ No (Public)
+- **Headers**: `Content-Type: application/json`
 - **Request Body**:
 ```json
 {
@@ -246,10 +299,12 @@ Computes all available start times on a target date for a specific treatment by 
 
 ---
 
-### 2.5. `POST /api/booking/reserve-hold`
-Atomically checks slot availability in a Firestore transaction and places a **10-minute temporary lock** (`status: "held"`). If the clinic requires an upfront payment, it generates a Stripe `PaymentIntent` via the existing FastAPI Stripe backend.
+### 3.5. `POST /api/booking/reserve-hold`
+Atomically checks slot availability in a Firestore transaction and places a **10-minute temporary lock** (`status: "held"`). If the clinic requires an upfront deposit, it calls the existing FastAPI Stripe backend to generate a `PaymentIntent`.
 
-- **Auth Required**: ❌ No
+- **Auth Required**: 🔓 Optional (`Authorization: Bearer <FIREBASE_ID_TOKEN>`)
+  - If token is passed, validates identity and links booking to authenticated user.
+  - If token is omitted, proceeds as a guest booking.
 - **Request Body**:
 ```json
 {
@@ -259,13 +314,13 @@ Atomically checks slot availability in a Firestore transaction and places a **10
   "doctorId": "doc_jenkins_01",
   "startDateTime": "2026-09-14T06:00:00.000Z",
   "patient": {
-    "patientId": "pat_optional_uid_if_signed_in", // null for guest booking
+    "patientId": "CqJSmHls3qPFHx48ncEVo1Kc9GB3", // Optional UID if signed in, null for guest
     "name": "Arif Choudhary",
     "email": "choudharyarif756@gmail.com",
     "phone": "+44 7700 900123",
     "notes": "First time receiving anti-wrinkle treatment"
   },
-  "bookingSource": "public_web" // "public_web" | "mobile_app" | "admin_staff"
+  "bookingSource": "mobile_app" // "public_web" | "mobile_app" | "admin_staff"
 }
 ```
 - **Response `201 Created` (No Payment Required)**:
@@ -293,7 +348,14 @@ Atomically checks slot availability in a Firestore transaction and places a **10
   }
 }
 ```
-- **Error Response `409 Conflict` (Slot Already Reserved/Booked)**:
+- **Error Response `403 Forbidden` (Anti-Spoofing Mismatch)**:
+```json
+{
+  "error": "Forbidden: Token UID does not match patient ID.",
+  "code": "FORBIDDEN"
+}
+```
+- **Error Response `409 Conflict` (Slot Already Taken)**:
 ```json
 {
   "error": "This slot has just been selected by another patient. Please choose another time."
@@ -302,10 +364,10 @@ Atomically checks slot availability in a Firestore transaction and places a **10
 
 ---
 
-### 2.6. `POST /api/booking/confirm`
+### 3.6. `POST /api/booking/confirm`
 Finalizes the booking: updates status to `confirmed`, clears the temporary hold, and dispatches the confirmation email with the **Google Calendar 1-Click Link** and `.ics` attachment via Resend.
 
-- **Auth Required**: ❌ No
+- **Auth Required**: 🔓 Optional (`Authorization: Bearer <FIREBASE_ID_TOKEN>`)
 - **Request Body**:
 ```json
 {
@@ -325,16 +387,16 @@ Finalizes the booking: updates status to `confirmed`, clears the temporary hold,
 
 ---
 
-### 2.7. `POST /api/booking/cancel`
-Cancels an appointment within the clinic's allowable cancellation window, issues an automated refund via the FastAPI Stripe backend (if a deposit was paid), and sends a cancellation email.
+### 3.7. `POST /api/booking/cancel`
+Cancels an appointment, issues an automated refund via the FastAPI Stripe backend (if a deposit was paid), and sends a cancellation email.
 
-- **Auth Required**: ❌ No
+- **Auth Required**: 🔓 Optional (`Authorization: Bearer <FIREBASE_ID_TOKEN>`)
 - **Request Body**:
 ```json
 {
   "clinicId": "clinic_harleystreet_test",
   "appointmentId": "apt_1789059318133_f51c8",
-  "cancelledBy": "patient",
+  "cancelledBy": "patient", // "patient" | "clinic_staff"
   "reason": "Rescheduled to next month"
 }
 ```
@@ -349,7 +411,7 @@ Cancels an appointment within the clinic's allowable cancellation window, issues
 
 ---
 
-### 2.8. `POST /api/dev/seed` (Development Only)
+### 3.8. `POST /api/dev/seed` (Development Only)
 Seeds test clinic data into Firestore for rapid local verification.
 
 - **Response `200 OK`**:
@@ -367,7 +429,7 @@ Seeds test clinic data into Firestore for rapid local verification.
 
 ---
 
-## 3. Firestore Database Contracts
+## 4. Firestore Database Contracts
 
 ```
 /clinics/{clinicId}
@@ -384,13 +446,13 @@ Seeds test clinic data into Firestore for rapid local verification.
 
 ---
 
-## 4. Public Subdomain Website Integration (`*.aurwell.app`)
+## 5. Public Subdomain Website Integration (`*.aurwell.app`)
 
 Each clinic receives its own public booking portal at `https://<subdomain>.aurwell.app`.
 
 ### Step 1: Wildcard DNS Setup
 In Cloudflare / Route 53:
-- Add a wildcard **CNAME** record for `*.aurwell.app` pointing to your Next.js host (e.g., Vercel / Cloud Run).
+- Add a wildcard **CNAME** record for `*.aurwell.app` pointing to your Next.js host.
 
 ### Step 2: Next.js Edge Middleware (`middleware.ts`)
 Intercepts incoming domain hostnames and extracts the subdomain prefix:
@@ -490,28 +552,9 @@ export default async function ClinicBookingPage({ params }: Props) {
 }
 ```
 
-### 4-Step Patient Booking Wizard Flow:
-```
-Step 1: Select Treatment (e.g. Botox) & Variant
-   │
-   ▼
-Step 2: Select Practitioner (or "Any Available")
-   │
-   ▼
-Step 3: Select Date & Time Slot
-   │    └── Calls POST /api/booking/available-slots
-   ▼
-Step 4: Enter Patient Details & Reserve Hold
-   │    └── Calls POST /api/booking/reserve-hold (Receives 10-min lock + clientSecret)
-   │
-   ▼
-Step 5: Stripe Elements Payment (if required) & Confirmation
-        └── Calls POST /api/booking/confirm
-```
-
 ---
 
-## 5. Mobile App Integration Guide
+## 6. Mobile App Integration Guide
 
 For the **Aurwell Patient Mobile App** (Flutter or React Native):
 
@@ -536,14 +579,62 @@ final response = await http.post(
 final slots = jsonDecode(response.body)['slots'];
 ```
 
-3. **Reserving & Confirming**:
-   - Call `/api/booking/reserve-hold` passing the patient's authenticated user UID (`patientId`).
-   - If `paymentRequired == true`, initialize the **Stripe PaymentSheet SDK** using `payment.clientSecret`.
-   - Call `/api/booking/confirm` after `Stripe.instance.presentPaymentSheet()` succeeds.
+3. **Reserving & Confirming with Auth Token**:
+```dart
+// Flutter Example: Reserve Slot Hold with Firebase Token
+final idToken = await FirebaseAuth.instance.currentUser?.getIdToken();
+
+final holdResponse = await http.post(
+  Uri.parse('$BACKEND_URL/api/booking/reserve-hold'),
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer $idToken',
+  },
+  body: jsonEncode({
+    'clinicId': clinicId,
+    'treatmentId': treatmentId,
+    'doctorId': doctorId,
+    'startDateTime': startDateTimeIso,
+    'patient': {
+      'patientId': FirebaseAuth.instance.currentUser?.uid,
+      'name': 'Patient Name',
+      'email': 'patient@example.com',
+      'phone': '+447700900123',
+    },
+    'bookingSource': 'mobile_app',
+  }),
+);
+
+final holdData = jsonDecode(holdResponse.body);
+
+if (holdData['paymentRequired'] == true) {
+  // Initialize Stripe PaymentSheet
+  await Stripe.instance.initPaymentSheet(
+    paymentSheetParameters: SetupPaymentSheetParameters(
+      paymentIntentClientSecret: holdData['payment']['clientSecret'],
+      merchantDisplayName: clinicName,
+    ),
+  );
+  await Stripe.instance.presentPaymentSheet();
+}
+
+// Confirm Appointment
+await http.post(
+  Uri.parse('$BACKEND_URL/api/booking/confirm'),
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer $idToken',
+  },
+  body: jsonEncode({
+    'clinicId': clinicId,
+    'appointmentId': holdData['appointmentId'],
+  }),
+);
+```
 
 ---
 
-## 6. Admin Panel Integration Guide
+## 7. Admin Panel Integration Guide
 
 The Admin Panel interacts **directly with Firestore** using the Firebase Client SDK:
 
@@ -590,7 +681,7 @@ async function updateClinicHours(clinicId: string, weeklyHours: any, dateOverrid
 
 ---
 
-## 7. Email & Google Calendar Link Generation
+## 8. Email & Google Calendar Link Generation
 
 Every confirmed appointment automatically generates a dynamic 1-click **Add to Google Calendar** link and attaches a `.ics` calendar file.
 
@@ -606,7 +697,7 @@ https://calendar.google.com/calendar/render?action=TEMPLATE&text=Botox+Anti-Wrin
 
 ---
 
-## 8. Deployment & Environment Variables
+## 9. Deployment & Environment Variables
 
 ### `.env` File Configuration:
 ```env
@@ -616,7 +707,7 @@ FIREBASE_ADMIN_PROJECT_ID=aurwell-2e48c
 FIREBASE_ADMIN_CLIENT_EMAIL=firebase-adminsdk-fbsvc@aurwell-2e48c.iam.gserviceaccount.com
 FIREBASE_ADMIN_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 STRIPE_BACKEND_URL=https://api-guexeyftta-uc.a.run.app
-RESEND_API_KEY=ghgfdhdfg
+RESEND_API_KEY=dfsdfas
 EMAIL_FROM="Aurwell Bookings <onboarding@resend.dev>"
 ```
 
